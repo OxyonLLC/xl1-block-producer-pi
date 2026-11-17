@@ -1,11 +1,35 @@
-# XL1 Block Producer — Raspberry Pi 3 B+
+# XL1 OxyNode
 
-> **An independent community project by LewSales.** Not affiliated with,
-> endorsed by, or supported by XYO Network. It runs the official
-> [`xl1-docker-images`](https://github.com/XYOracleNetwork/xl1-docker-images)
-> producer unmodified; everything around it — the dashboard, alerting, preflight
-> and operator tooling — is mine. Bugs here are mine too: open an issue on this
-> repo, not with XYO.
+**Turn the Raspberry Pi in your drawer into an XL1 block producer.** XL1 OxyNode is Oxyon's open-source kit for running an [XL1](https://xyo.network) block producer on a Raspberry Pi 3 B+: the producer, a live dashboard, alerting, and a graphical 3.5" touch display that shows your node at a glance.
+
+Plenty of XYO folks have an old Pi like this one. OxyNode gives it a job.
+
+| | |
+|---|---|
+| ![The OxyNode panel, hybrid theme](docs/oxynode/screen-hybrid-overview.png) | ![The producer race, retro theme](docs/oxynode/screen-retro-race.png) |
+| ![Pi vitals, modern theme](docs/oxynode/screen-modern-pi.png) | ![Every block the Pi wins gets a celebration](docs/oxynode/screen-block-won.png) |
+
+*The screens above are rendered from a live OxyNode, LewSales-pi3, an XL1 Mainnet producer with 52,000+ blocks.*
+
+## What you get
+- **An XL1 block producer** on a Pi 3 B+ (64-bit Raspberry Pi OS), running the official [`xl1-docker-images`](https://github.com/XYOracleNetwork/xl1-docker-images) producer unmodified.
+- **A local dashboard** with chain status, your producer's blocks and rewards, the producer race, Pi health, and a JSON status API.
+- **A 3.5" touch display** (optional) with three themes: hybrid, retro and modern. Tap or click to change pages; hold for three seconds (or middle-click a USB mouse) to change theme.
+- **Alerts** when something needs you, and **self-maintenance**: host security updates and a doctor command.
+
+## What you need
+- A **Raspberry Pi 3 B+** (a Pi 4 works too), a 32 GB+ microSD card, power and network.
+- Optional: a 3.5" SPI touch panel (ILI9486 / "PiScreen" type).
+- An XL1 producer key. **XL1 Sequence**, the public test network, is open to everyone. **Producing on XL1 Mainnet** requires your producer address to be on XYO's producer allow list.
+
+## Who makes it
+**Oxyon LLC** ([oxyon.io](https://oxyon.io)), built by LewSales. It's open source, so bugs and questions go to this repo's issues.
+
+> **Independent of XYO Network.** Not affiliated with, endorsed by, or supported by XYO Network. OxyNode runs XYO's official producer image unmodified; everything around it (the dashboard, display, alerting, preflight and operator tooling) is Oxyon's. Please don't take OxyNode issues to XYO.
+
+---
+
+# Setup guide
 
 A provisioning bundle for running an XL1 federated block producer on the Sequence
 (beta) network, with a local status dashboard.
