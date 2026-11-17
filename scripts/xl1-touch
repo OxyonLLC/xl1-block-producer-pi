@@ -10,8 +10,12 @@ gets it silently wrong rather than obviously wrong. Duration needs no
 calibration, cannot be misconfigured, and works the same whichever way up the
 panel is mounted.
 
-    short tap    next page
-    long press   back to the overview
+    short tap    next page              left click     next page
+    long press   back to the overview   right click    back to the overview
+    hold 3 s     next theme             middle click   next theme (or hold left 3 s)
+
+A USB mouse works too, plugged in at any time (looked for every 10 s). Themes are for
+xl1-screen-gfx (hybrid, retro, modern); the page stays when the theme changes.
 
 State is a single integer in a file that xl1-screen polls. No socket, no
 protocol, and if this daemon is not running the panel simply stays on page 0 —
@@ -36,6 +40,10 @@ DEVICE = os.environ.get("XL1_TOUCH_DEVICE", "")
 STATE = os.environ.get("XL1_TOUCH_STATE", "/run/xl1-screen/page")
 PAGES = int(os.environ.get("XL1_TOUCH_PAGES", "5"))
 LONG_PRESS = float(os.environ.get("XL1_TOUCH_LONG_PRESS", "0.7"))
+# Themes for xl1-screen-gfx, written next to the page file. The text console ignores it.
+THEME_PRESS = float(os.environ.get("XL1_TOUCH_THEME_PRESS", "3.0"))
+THEME_STATE = os.environ.get("XL1_TOUCH_THEME_STATE", os.path.join(os.path.dirname(STATE), "theme"))
+THEMES = [t for t in os.environ.get("XL1_TOUCH_THEMES", "hybrid,retro,modern").split(",") if t]
 # Two events from one physical tap is the usual failure of a resistive panel.
 DEBOUNCE = float(os.environ.get("XL1_TOUCH_DEBOUNCE", "0.25"))
 
@@ -62,80 +70,163 @@ def find_device():
     return "/dev/input/event0"
 
 
-def write_page(n):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    tmp = f"{STATE}.tmp"
+def write_state(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="ascii") as f:
-        f.write(str(n))
-    # Atomic, so xl1-screen can never read a half-written value.
-    os.replace(tmp, STATE)
-    os.chmod(STATE, 0o644)
+        f.write(str(value))
+    # Atomic, so the screen can never read a half-written value.
+    os.replace(tmp, path)
+    os.chmod(path, 0o644)
+
+
+def write_page(n):
+    write_state(STATE, n)
+
+
+def read_theme():
+    try:
+        with open(THEME_STATE, encoding="ascii") as f:
+            t = f.read().strip()
+        return THEMES.index(t) if t in THEMES else 0
+    except OSError:
+        return 0
+
+
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+RESCAN = 10.0  # seconds between looks for a newly plugged-in mouse
+
+
+def find_mice(exclude):
+    """Every mouse-like input device (a USB mouse, a trackpad), by /proc rather than event number,
+    skipping the touchscreen itself (touch panels often register a mouse handler too)."""
+    mice = []
+    try:
+        with open("/proc/bus/input/devices", encoding="utf-8", errors="replace") as f:
+            blocks = f.read().split("\n\n")
+    except OSError:
+        return mice
+    for b in blocks:
+        handlers = next((ln for ln in b.splitlines() if ln.startswith("H: Handlers=")), "")
+        if "mouse" not in handlers or "touch" in b.lower():
+            continue
+        for tok in handlers.split():
+            if tok.startswith("event"):
+                path = f"/dev/input/{tok}"
+                if path != exclude:
+                    mice.append(path)
+    return mice
 
 
 def main():
     calibrate = "--calibrate" in sys.argv
-    dev = find_device()
+    touch_dev = find_device()
+    devices = {}  # open file -> (path, kind)
     try:
-        f = open(dev, "rb", buffering=0)
+        devices[open(touch_dev, "rb", buffering=0)] = (touch_dev, "touch")
     except PermissionError:
-        print(f"xl1-touch: need root to read {dev}", file=sys.stderr)
+        print(f"xl1-touch: need root to read {touch_dev}", file=sys.stderr)
         return 1
     except OSError as e:
-        print(f"xl1-touch: cannot open {dev}: {e}", file=sys.stderr)
-        return 1
+        # No panel touch (or it is unplugged): a mouse can still drive the screen.
+        print(f"xl1-touch: cannot open {touch_dev}: {e}; mouse only", file=sys.stderr, flush=True)
 
-    print(f"xl1-touch: reading {dev}"
-          f"{' (calibrate)' if calibrate else f', {PAGES} pages, long press {LONG_PRESS}s'}",
+    def add_mice():
+        known = {p for p, _k in devices.values()}
+        for path in find_mice(touch_dev):
+            if path in known:
+                continue
+            try:
+                devices[open(path, "rb", buffering=0)] = (path, "mouse")
+                print(f"xl1-touch: mouse at {path}", flush=True)
+            except OSError:
+                continue
+
+    add_mice()
+    if not devices:
+        return 1
+    print(f"xl1-touch: reading {', '.join(p for p, _k in devices.values())}"
+          f"{' (calibrate)' if calibrate else f', {PAGES} pages, long press {LONG_PRESS}s, theme hold {THEME_PRESS}s'}",
           flush=True)
 
     page = 0
+    theme = read_theme()  # a theme survives restarts until the next 3-second hold
     if not calibrate:
         write_page(page)
 
-    down_at = None
+    down_at = {}
     last_tap = 0.0
+    last_scan = time.monotonic()
     x = y = None
 
-    while True:
-        if not select.select([f], [], [], 1.0)[0]:
-            continue
-        data = f.read(SZ)
-        if not data or len(data) < SZ:
-            continue
-        _s, _us, typ, code, val = struct.unpack(FMT, data)
-
-        if typ == EV_ABS:
-            if code == ABS_X:
-                x = val
-            elif code == ABS_Y:
-                y = val
-            continue
-        if typ != EV_KEY or code != BTN_TOUCH:
-            continue
-
-        now = time.monotonic()
-        if val:                       # press
-            down_at = now
-            continue
-
-        # release
-        if down_at is None:
-            continue
-        held, down_at = now - down_at, None
-        if now - last_tap < DEBOUNCE:
-            continue
-        last_tap = now
-
-        if calibrate:
-            print(f"  tap: x={x} y={y} held={held:.2f}s "
-                  f"-> {'LONG (home)' if held >= LONG_PRESS else 'short (next)'}", flush=True)
-            continue
-
-        page = 0 if held >= LONG_PRESS else (page + 1) % PAGES
+    def act(kind):
+        nonlocal page, theme
         try:
-            write_page(page)
+            if kind == "theme" and THEMES:
+                theme = (theme + 1) % len(THEMES)
+                write_state(THEME_STATE, THEMES[theme])
+            else:
+                page = 0 if kind == "home" else (page + 1) % PAGES
+                write_page(page)
         except OSError as e:
-            print(f"xl1-touch: could not write {STATE}: {e}", file=sys.stderr, flush=True)
+            print(f"xl1-touch: could not write state: {e}", file=sys.stderr, flush=True)
+
+    while True:
+        now = time.monotonic()
+        if now - last_scan >= RESCAN:
+            last_scan = now
+            add_mice()
+        ready = select.select(list(devices), [], [], 1.0)[0]
+        for f in ready:
+            path, dkind = devices[f]
+            try:
+                data = f.read(SZ)
+            except OSError:  # unplugged
+                devices.pop(f, None)
+                f.close()
+                print(f"xl1-touch: {path} went away", flush=True)
+                continue
+            if not data or len(data) < SZ:
+                continue
+            _s, _us, typ, code, val = struct.unpack(FMT, data)
+
+            if typ == EV_ABS:
+                if code == ABS_X:
+                    x = val
+                elif code == ABS_Y:
+                    y = val
+                continue
+            if typ != EV_KEY or code not in (BTN_TOUCH, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
+                continue
+            # A touch panel that also reports BTN_LEFT would double-count: take only BTN_TOUCH from it.
+            if dkind == "touch" and code != BTN_TOUCH:
+                continue
+
+            now = time.monotonic()
+            key = (path, code)
+            if val:                       # press
+                down_at[key] = now
+                continue
+            if val != 0 or key not in down_at:
+                continue
+            held = now - down_at.pop(key)
+            if now - last_tap < DEBOUNCE:
+                continue
+            last_tap = now
+
+            if code == BTN_RIGHT:
+                kind = "home"
+            elif code == BTN_MIDDLE or held >= THEME_PRESS:
+                kind = "theme"
+            elif held >= LONG_PRESS and code == BTN_TOUCH:
+                kind = "home"
+            else:
+                kind = "next"
+
+            if calibrate:
+                print(f"  {dkind} {hex(code)}: x={x} y={y} held={held:.2f}s -> {kind}", flush=True)
+                continue
+            act(kind)
 
 
 if __name__ == "__main__":

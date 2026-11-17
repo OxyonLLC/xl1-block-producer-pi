@@ -25,6 +25,12 @@ for the differences and why each one exists.
 | `scripts/xl1ctl` | Day-to-day control: status, start/stop, logs, backup, doctor. |
 | `scripts/xl1-screen` | Console dashboard for a directly attached display. |
 | `scripts/xl1-screen-setup.sh` | Brings up a 3.5" SPI panel on Bookworm and puts the dashboard on it. |
+| `scripts/xl1-screen-gfx` | Graphical dashboard for the 3.5" panel: three themes (hybrid, retro, modern), drawn straight to the framebuffer. Replaces the console one via `systemd/xl1-screen-gfx.service`. |
+| `scripts/xl1-touch` | Turns taps (and USB mouse clicks) on the panel into page and theme changes. |
+| `scripts/xl1-autoupdate.sh` | Checks the published manifest and installs a newer bundle when one is out. |
+| `scripts/xl1-host-update.sh` | Keeps the Debian packages the producer runs on patched (security fixes on the next run). |
+| `scripts/xl1-publish.sh` | Publishes this node's public status (an allow-listed projection of the dashboard). |
+| `scripts/deploy-dashboard.sh` | Ships a rebuilt dashboard to the Pi by copying three files. |
 | `overlays/` | Device-tree blobs for panels the stock firmware does not ship. |
 | `windows/` | Double-clickable `.cmd` launchers that drive the Pi over SSH. |
 | `xl1-local-arm64.tar.gz` | The producer image, cross-built for arm64. |
