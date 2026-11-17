@@ -1,0 +1,31 @@
+[Unit]
+Description=XL1 graphical dashboard on the attached 480x320 panel
+After=xl1-dashboard.service getty@tty1.service
+Wants=xl1-dashboard.service
+# The panel shows one dashboard at a time: this one replaces the text console (xl1-screen)
+# and takes tty1 from the login prompt. Roll back:
+#   systemctl disable --now xl1-screen-gfx && systemctl enable --now xl1-screen
+Conflicts=xl1-screen.service getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xl1-screen-gfx
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# The producer comes first: low priority, a hard memory cap and a CPU ceiling.
+Nice=10
+CPUQuota=25%
+MemoryMax=64M
+
+# Writes the panel (/dev/fb1), switches tty1 to graphics mode, reads /run/xl1-screen and
+# the local dashboard API. Nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
