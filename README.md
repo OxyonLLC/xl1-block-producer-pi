@@ -1,15 +1,15 @@
-# XL1 OxyNode
+# XL1 OxyoNode
 
-**Turn the Raspberry Pi in your drawer into an XL1 block producer.** XL1 OxyNode is Oxyon's open-source kit for running an [XL1](https://xyo.network) block producer on a Raspberry Pi 3 B+: the producer, a live dashboard, alerting, and a graphical 3.5" touch display that shows your node at a glance.
+**Turn the Raspberry Pi in your drawer into an XL1 block producer.** XL1 OxyoNode is Oxyon's open-source kit for running an [XL1](https://xyo.network) block producer on a Raspberry Pi 3 B+: the producer, a live dashboard, alerting, and a graphical 3.5" touch display that shows your node at a glance.
 
-Plenty of XYO folks have an old Pi like this one. OxyNode gives it a job.
+Plenty of XYO folks have an old Pi like this one. OxyoNode gives it a job.
 
 | | |
 |---|---|
-| ![The OxyNode panel, hybrid theme](docs/oxynode/screen-hybrid-overview.png) | ![The producer race, retro theme](docs/oxynode/screen-retro-race.png) |
-| ![Pi vitals, modern theme](docs/oxynode/screen-modern-pi.png) | ![Every block the Pi wins gets a celebration](docs/oxynode/screen-block-won.png) |
+| ![The OxyoNode panel, hybrid theme](docs/oxyonode/screen-hybrid-overview.png) | ![The producer race, retro theme](docs/oxyonode/screen-retro-race.png) |
+| ![Pi vitals, modern theme](docs/oxyonode/screen-modern-pi.png) | ![Every block the Pi wins gets a celebration](docs/oxyonode/screen-block-won.png) |
 
-*The screens above are rendered from a live OxyNode, LewSales-pi3, an XL1 Mainnet producer with 52,000+ blocks.*
+*The screens above are rendered from a live OxyoNode, LewSales-pi3, an XL1 Mainnet producer with 52,000+ blocks.*
 
 ## What you get
 - **An XL1 block producer** on a Pi 3 B+ (64-bit Raspberry Pi OS), running the official [`xl1-docker-images`](https://github.com/XYOracleNetwork/xl1-docker-images) producer unmodified.
@@ -25,7 +25,7 @@ Plenty of XYO folks have an old Pi like this one. OxyNode gives it a job.
 ## Who makes it
 **Oxyon LLC** ([oxyon.io](https://oxyon.io)), built by LewSales. It's open source, so bugs and questions go to this repo's issues.
 
-> **Independent of XYO Network.** Not affiliated with, endorsed by, or supported by XYO Network. OxyNode runs XYO's official producer image unmodified; everything around it (the dashboard, display, alerting, preflight and operator tooling) is Oxyon's. Please don't take OxyNode issues to XYO.
+> **Independent of XYO Network.** Not affiliated with, endorsed by, or supported by XYO Network. OxyoNode runs XYO's official producer image unmodified; everything around it (the dashboard, display, alerting, preflight and operator tooling) is Oxyon's. Please don't take OxyoNode issues to XYO.
 
 ---
 
