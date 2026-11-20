@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""xl1-screen-gfx — a graphical XL1 dashboard for the 3.5" 480x320 panel.
+
+Draws straight to the panel's framebuffer (/dev/fb1, RGB565) with Pillow. No X, no browser:
+on a 1 GB Pi that is producing blocks, the producer always comes first, so this redraws only
+when something changes, sleeps between polls, and runs niced inside a memory cap (systemd).
+
+Reads the same /api/status as the web dashboard and the text console (xl1-screen), so all
+three agree. Touch is xl1-touch's job: it writes the page number to /run/xl1-screen/page and,
+on a 3-second hold, the theme to /run/xl1-screen/theme. Without xl1-touch it shows page 0
+in the default theme, forever.
+
+Three themes, all built from Pillow's own embedded fonts (nothing to install or license):
+  retro    pixel fonts, neon on black, the mole as a sprite
+  modern   smooth type, dark Oxyon colours, gauges and bars
+  hybrid   modern layout and numbers, retro labels, neon and the mole
+
+When the Pi wins a block, every theme plays a short celebration.
+
+  xl1-screen-gfx                         # run on the panel until stopped
+  xl1-screen-gfx --png out.png --status status.json --theme retro --page 0
+  xl1-screen-gfx --preview-dir DIR --status status.json     # every theme x page, plus the win
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+from PIL import Image, ImageDraw, ImageFont
+
+W, H = 480, 320
+API = os.environ.get("XL1_SCREEN_API", "http://127.0.0.1:8088/api/status")
+FB = os.environ.get("XL1_SCREEN_FB", "/dev/fb1")
+STATE_DIR = os.environ.get("XL1_SCREEN_STATE_DIR", "/run/xl1-screen")
+INTERVAL = float(os.environ.get("XL1_SCREEN_INTERVAL", "5"))
+THEMES = ("hybrid", "retro", "modern")
+DEFAULT_THEME = os.environ.get("XL1_SCREEN_THEME", "hybrid")
+PAGES = 5
+PAGE_NAMES = ("OVERVIEW", "RACE", "TREND", "REWARDS", "THE PI")
+
+# ── data helpers ──────────────────────────────────────────────────────────────
+
+
+def dig(d, *path, default=None):
+    for k in path:
+        if isinstance(d, dict) and k in d:
+            d = d[k]
+        elif isinstance(d, list) and isinstance(k, int) and -len(d) <= k < len(d):
+            d = d[k]
+        else:
+            return default
+    return d
+
+
+def num(v, default=0.0):
+    try:
+        return float(str(v).replace(",", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def group(n) -> str:
+    try:
+        return f"{int(round(float(n))):,}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def short_xl1(v) -> str:
+    x = num(v, None) if v is not None else None
+    if x is None:
+        return "—"
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(x) >= div:
+            return f"{x / div:.2f}{suf}"
+    return f"{x:,.2f}"
+
+
+def lifetime_blocks(s) -> int:
+    return int(num(dig(s, "derived", "rewards", "lifetime", "blocks"), 0) or num(dig(s, "peers", "self", "blocks"), 0))
+
+
+def uptime_text(sec) -> str:
+    sec = int(num(sec, 0))
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    return f"{d}d {h}h" if d else f"{h}h {r // 60}m"
+
+
+# ── themes ────────────────────────────────────────────────────────────────────
+
+PALETTES = {
+    "retro": dict(bg=(8, 6, 20), panel=(24, 18, 52), fg=(230, 240, 255), dim=(120, 120, 170), accent=(0, 255, 200),
+                  accent2=(255, 64, 200), good=(80, 255, 120), warn=(255, 210, 60), bad=(255, 70, 70), self=(255, 210, 60), grid=(40, 30, 80)),
+    "modern": dict(bg=(10, 10, 12), panel=(24, 24, 28), fg=(246, 244, 239), dim=(140, 138, 132), accent=(201, 165, 69),
+                   accent2=(120, 160, 255), good=(70, 200, 120), warn=(230, 180, 60), bad=(230, 80, 80), self=(201, 165, 69), grid=(44, 44, 50)),
+    "hybrid": dict(bg=(10, 10, 14), panel=(24, 22, 34), fg=(246, 244, 239), dim=(140, 138, 150), accent=(201, 165, 69),
+                   accent2=(0, 230, 190), good=(80, 240, 130), warn=(255, 205, 60), bad=(255, 80, 80), self=(255, 205, 60), grid=(42, 38, 58)),
+}
+
+_smooth: dict[int, ImageFont.FreeTypeFont] = {}
+_bitmap = None
+
+
+def smooth(size: int):
+    if size not in _smooth:
+        _smooth[size] = ImageFont.load_default(size=size)  # Pillow's embedded Aileron
+    return _smooth[size]
+
+
+def bitmap():
+    global _bitmap
+    if _bitmap is None:
+        _bitmap = ImageFont.load_default_imagefont()  # Pillow's embedded 6x11 bitmap font
+    return _bitmap
+
+
+# The embedded bitmap font covers Latin-1 only; map the few other characters the pages use.
+_PIXEL_SUBS = {"≈": "~", "…": "...", "·": "-", "—": "-", "–": "-", "→": "->", "✓": "ok"}
+
+
+def pixel_safe(s: str) -> str:
+    s = "".join(_PIXEL_SUBS.get(ch, ch) for ch in s)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+class Canvas:
+    def __init__(self, theme: str):
+        self.theme = theme
+        self.p = PALETTES[theme]
+        self.img = Image.new("RGB", (W, H), self.p["bg"])
+        self.d = ImageDraw.Draw(self.img)
+
+    # Text: "pixel" renders the bitmap font then scales it with hard edges (chunky retro type);
+    # "smooth" uses the embedded TrueType font. Returns the drawn width.
+    def text(self, xy, s, size, color, style=None, anchor="la"):
+        style = style or ("pixel" if self.theme == "retro" else "smooth")
+        s = str(s)
+        if style == "smooth":
+            f = smooth(size)
+            self.d.text(xy, s, font=f, fill=color, anchor=anchor)
+            return int(self.d.textlength(s, font=f))
+        f = bitmap()
+        s = pixel_safe(s)
+        bx = f.getbbox(s)
+        tw, th = max(1, bx[2]), max(1, bx[3])
+        scale = max(1, round(size / 9))
+        mask = Image.new("L", (tw, th), 0)
+        ImageDraw.Draw(mask).text((0, 0), s, font=f, fill=255)
+        mask = mask.resize((tw * scale, th * scale), Image.NEAREST)
+        w, h = mask.size
+        x, y = xy
+        if anchor[0] == "r":
+            x -= w
+        elif anchor[0] == "m":
+            x -= w // 2
+        if anchor[1] == "m":
+            y -= h // 2
+        elif anchor[1] in "bs":
+            y -= h
+        self.img.paste(Image.new("RGB", mask.size, color), (int(x), int(y)), mask)
+        return w
+
+    def label(self, xy, s, size=12, color=None, anchor="la"):
+        # Small caps-style labels: pixel in retro and hybrid, smooth in modern.
+        style = "smooth" if self.theme == "modern" else "pixel"
+        return self.text(xy, s.upper(), size, color or self.p["dim"], style=style, anchor=anchor)
+
+    def box(self, xy, fill=None, outline=None, r=8, width=1):
+        if self.theme == "retro":
+            self.d.rectangle(xy, fill=fill, outline=outline, width=2 if outline else 0)
+        else:
+            self.d.rounded_rectangle(xy, radius=r, fill=fill, outline=outline, width=width)
+
+    def bar(self, x, y, w, h, frac, color):
+        frac = max(0.0, min(1.0, frac))
+        self.box((x, y, x + w, y + h), fill=self.p["grid"], r=h // 2)
+        if frac > 0:
+            if self.theme == "retro":
+                # Segmented bar: one block per 8 px, like an arcade power meter.
+                segs = int(frac * w // 8)
+                for i in range(segs):
+                    self.d.rectangle((x + i * 8 + 1, y + 1, x + i * 8 + 6, y + h - 1), fill=color)
+            else:
+                self.box((x, y, x + max(h, int(w * frac)), y + h), fill=color, r=h // 2)
+
+
+# ── the mole (pixel art, 16x16) ───────────────────────────────────────────────
+
+MOLE = [
+    "......XXXX......",
+    "....XXXXXXXX....",
+    "...XXXXXXXXXX...",
+    "..XXXWWXXWWXXX..",
+    "..XXXWKXXWKXXX..",
+    "..XXXXXXXXXXXX..",
+    "..XXXXXPPXXXXX..",
+    "...XXXPPPPXXX...",
+    "...XXXXTTXXXX...",
+    "....XXXXXXXX....",
+    "...HHXXXXXXHH...",
+    "..HHHXXXXXXHHH..",
+    "..HH.XXXXXX.HH..",
+    "....XXXXXXXX....",
+    "....XX....XX....",
+    "...XXX....XXX...",
+]
+MOLE_COLORS = {"X": (120, 84, 60), "W": (255, 255, 255), "K": (10, 10, 10), "P": (255, 140, 170), "T": (255, 255, 255), "H": (255, 205, 60)}
+
+
+def draw_mole(c: Canvas, x, y, scale=4):
+    for j, row in enumerate(MOLE):
+        for i, ch in enumerate(row):
+            col = MOLE_COLORS.get(ch)
+            if col:
+                c.d.rectangle((x + i * scale, y + j * scale, x + (i + 1) * scale - 1, y + (j + 1) * scale - 1), fill=col)
+
+
+# ── the Oxyon mark (from oxyon.io's logo-mark@2x.png, pre-sized in screen/) ─────
+
+ASSETS = os.environ.get("XL1_SCREEN_ASSETS", "/usr/local/share/xl1-screen")
+_marks: dict[str, Image.Image | None] = {}
+
+
+def mark(name: str):
+    """oxyon-mark-28 / -150 / -pixel, or None if not installed (the mole stands in)."""
+    if name not in _marks:
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "screen")
+        _marks[name] = None
+        for d in (ASSETS, here):
+            try:
+                _marks[name] = Image.open(os.path.join(d, f"oxyon-mark-{name}.png")).convert("RGBA")
+                break
+            except OSError:
+                continue
+    return _marks[name]
+
+
+def paste_mark(c: "Canvas", name: str, x: int, y: int) -> bool:
+    m = mark(name)
+    if m is None:
+        return False
+    c.img.paste(m, (x, y), m)
+    return True
+
+
+def render_splash(theme: str) -> Image.Image:
+    """Shown for a moment when the screen starts: the Oxyon mark, then the dashboard."""
+    c = Canvas(theme if theme in THEMES else DEFAULT_THEME)
+    p = c.p
+    m = mark("150")
+    if m is not None:
+        c.img.paste(m, ((W - m.width) // 2, 40), m)
+    else:
+        draw_mole(c, W // 2 - 48, 60, scale=6)
+    c.text((W // 2, 214), "OXYON", 34, p["accent"], style="pixel" if theme == "retro" else "smooth", anchor="ma")
+    c.label((W // 2, 262), "XL1 block producer · LewSales-pi3", 11, anchor="ma")
+    return c.img
+
+
+# ── chrome: header and page dots ──────────────────────────────────────────────
+
+
+def header(c: Canvas, s, page):
+    p = c.p
+    status = dig(s, "status", default="unknown")
+    ok = status == "ok"
+    name = dig(s, "peers", "self", "label", default="LewSales-pi3")
+    if c.theme == "modern":
+        c.d.rectangle((0, 0, W, 34), fill=p["panel"])
+    else:
+        c.d.rectangle((0, 0, W, 34), fill=p["panel"])
+        c.d.line((0, 34, W, 34), fill=p["accent2"], width=2)
+    if not paste_mark(c, "pixel" if c.theme == "retro" else "28", 8, 3):
+        draw_mole(c, 8, 3, scale=2)
+    tx = 46
+    c.text((tx, 17), f"XL1 · {name}", 18, p["fg"], anchor="lm")
+    clock = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    cw = c.text((W - 12, 17), clock, 14, p["dim"], anchor="rm")
+    dot = p["good"] if ok else (p["warn"] if status == "degraded" else p["bad"])
+    dx = W - 12 - cw - 20
+    if c.theme == "retro":
+        c.d.rectangle((dx, 11, dx + 11, 22), fill=dot)
+    else:
+        c.d.ellipse((dx, 11, dx + 12, 23), fill=dot)
+    # page dots and name
+    for i in range(PAGES):
+        x = W // 2 - (PAGES * 14) // 2 + i * 14
+        fill = p["accent"] if i == page else p["grid"]
+        if c.theme == "retro":
+            c.d.rectangle((x, 306, x + 7, 313), fill=fill)
+        else:
+            c.d.ellipse((x, 306, x + 7, 313), fill=fill)
+    c.label((12, 309), PAGE_NAMES[page], 10, anchor="lm")
+    c.label((W - 12, 309), c.theme, 10, anchor="rm")
+
+
+# ── pages ─────────────────────────────────────────────────────────────────────
+
+
+def page_overview(c: Canvas, s):
+    p = c.p
+    blocks = lifetime_blocks(s)
+    big = c.theme if c.theme != "hybrid" else "modern"
+    c.label((20, 50), "blocks produced, lifetime")
+    c.text((20, 68), group(blocks), 64 if big == "modern" else 54, p["accent"],
+           style="smooth" if big == "modern" else "pixel")
+    rank = dig(s, "peers", "self", "rank", default="—")
+    share = dig(s, "peers", "self", "sharePercent", default=0)
+    producers = dig(s, "peers", "producers", default="—")
+    cards = [
+        ("rank", f"#{rank}", f"of {producers}"),
+        ("share", f"{num(share):.2f}%", "of mainnet"),
+        ("per hour", f"{num(dig(s, 'derived', 'blocksPerHourNode')):.0f}", "blocks"),
+    ]
+    for i, (k, v, sub) in enumerate(cards):
+        x = 20 + i * 150
+        c.box((x, 160, x + 138, 236), fill=p["panel"], outline=p["grid"] if c.theme != "retro" else p["accent2"])
+        c.label((x + 10, 170), k)
+        c.text((x + 10, 188), v, 28, p["fg"])
+        c.label((x + 10, 222), sub, 10)
+    head = dig(s, "chain", "currentBlock")
+    spb = num(dig(s, "derived", "secondsPerBlock"), 0)
+    ok = dig(s, "chain", "ok", default=False)
+    c.label((20, 252), "mainnet head")
+    c.text((20, 268), f"#{group(head)}", 22, p["fg"])
+    c.label((260, 252), "block time")
+    c.text((260, 268), f"{spb:.1f}s", 22, p["good"] if ok else p["bad"])
+    lag = dig(s, "chain", "finalizationLag", default=0)
+    c.label((370, 252), "final lag")
+    c.text((370, 268), f"{lag}", 22, p["good"] if not lag else p["warn"])
+
+
+def page_race(c: Canvas, s):
+    p = c.p
+    top = dig(s, "peers", "top", default=[]) or []
+    c.label((20, 46), "mainnet producer race · since scanning began")
+    rows = top[:7]
+    most = max([num(r.get("blocks")) for r in rows] or [1]) or 1
+    for i, r in enumerate(rows):
+        y = 66 + i * 33
+        me = bool(r.get("isSelf"))
+        name = r.get("label") or f"{str(r.get('address', ''))[:4]}…{str(r.get('address', ''))[-4:]}"
+        col = p["self"] if me else p["fg"]
+        c.text((20, y + 2), f"{i + 1}", 16, p["dim"])
+        c.text((44, y + 2), name[:16], 16, col)
+        c.bar(190, y + 6, 190, 12, num(r.get("blocks")) / most, p["self"] if me else p["accent2"])
+        c.text((W - 20, y + 2), f"{num(r.get('sharePercent')):.1f}%", 16, col, anchor="ra")
+
+
+def page_trend(c: Canvas, s):
+    p = c.p
+    daily = (dig(s, "trend", "daily", default=[]) or [])[-14:]
+    c.label((20, 46), "blocks per day · last 14 days")
+    if daily:
+        most = max(num(d.get("blocks")) for d in daily) or 1
+        bw = (W - 40) // len(daily)
+        for i, d in enumerate(daily):
+            b = num(d.get("blocks"))
+            h = int(140 * b / most)
+            x = 20 + i * bw
+            last = i == len(daily) - 1
+            col = p["accent"] if last else p["accent2"]
+            if c.theme == "retro":
+                for yy in range(200 - h, 200, 6):
+                    c.d.rectangle((x + 2, yy, x + bw - 4, yy + 4), fill=col)
+            else:
+                c.box((x + 2, 200 - h, x + bw - 4, 200), fill=col, r=3)
+        c.label((20, 206), daily[0].get("day", "")[5:], 10)
+        c.label((W - 20, 206), daily[-1].get("day", "")[5:], 10, anchor="ra")
+    hours = (dig(s, "continuity", "hours", default=[]) or [])[-24:]
+    c.label((20, 226), "wins per hour · last 24 h")
+    if hours:
+        wins = [num(h.get("wins")) for h in hours]
+        most = max(wins) or 1
+        pts = [(20 + i * (W - 40) / max(1, len(wins) - 1), 292 - 46 * w / most) for i, w in enumerate(wins)]
+        c.d.line(pts, fill=p["good"], width=3 if c.theme != "retro" else 4)
+        c.text((W - 20, 230), f"{group(sum(wins))} in 24 h", 14, p["good"], anchor="ra")
+
+
+def page_rewards(c: Canvas, s):
+    p = c.p
+    bal = dig(s, "chain", "balances", "reward", "xl1")
+    price = num(dig(s, "price", "value"), 0)
+    notional = num(dig(s, "price", "notional"), 0)
+    c.label((20, 50), "reward wallet")
+    c.text((20, 68), f"{short_xl1(bal)} XL1", 46, p["accent"])
+    c.text((20, 124), f"≈ ${notional:,.2f}" if notional else "price unavailable", 20, p["fg"])
+    cards = [
+        ("per block", f"{num(dig(s, 'derived', 'rewards', 'perBlock', 'xl1')):.3f}", "XL1"),
+        ("per hour", short_xl1(dig(s, "derived", "rewardPerHour")), "XL1"),
+        ("XL1 price", f"${price:.6f}" if price else "—", f"{num(dig(s, 'price', 'change24h')):+.2f}% 24h"),
+    ]
+    for i, (k, v, sub) in enumerate(cards):
+        x = 20 + i * 150
+        c.box((x, 168, x + 138, 244), fill=p["panel"], outline=p["grid"] if c.theme != "retro" else p["accent2"])
+        c.label((x + 10, 178), k)
+        c.text((x + 10, 196), v, 22, p["fg"])
+        c.label((x + 10, 230), sub, 10)
+    nxt = dig(s, "derived", "rewards", "nextStep")
+    if nxt:
+        c.label((20, 262), "next reward step")
+        c.text((20, 276), f"#{group(nxt.get('atBlock'))} ({group(nxt.get('blocksAway'))} to go)", 16, p["dim"])
+
+
+def gauge(c: Canvas, cx, cy, r, frac, color, label, value):
+    p = c.p
+    frac = max(0.0, min(1.0, frac))
+    if c.theme == "retro":
+        c.d.rectangle((cx - r, cy - 10, cx + r, cy + 10), outline=p["grid"], width=2)
+        c.bar(cx - r + 4, cy - 6, 2 * r - 8, 12, frac, color)
+        c.text((cx, cy - 34), value, 22, p["fg"], anchor="ma")
+        c.label((cx, cy + 22), label, 10, anchor="ma")
+        return
+    box = (cx - r, cy - r, cx + r, cy + r)
+    c.d.arc(box, 135, 405, fill=p["grid"], width=10)
+    if frac > 0:
+        c.d.arc(box, 135, 135 + 270 * frac, fill=color, width=10)
+    c.text((cx, cy - 4), value, 20, p["fg"], anchor="mm")
+    c.label((cx, cy + r - 6), label, 10, anchor="mm")
+
+
+def page_pi(c: Canvas, s):
+    p = c.p
+    sysd = dig(s, "system", default={}) or {}
+    temp = num(sysd.get("cpuTempC"), 0)
+    mem = num(dig(sysd, "memory", "usedPercent"), 0)
+    disk = num(dig(sysd, "disk", "usedPercent"), 0)
+    tcol = p["good"] if temp < 65 else (p["warn"] if temp < 75 else p["bad"])
+    gauge(c, 85, 120, 58, temp / 85, tcol, "cpu temp", f"{temp:.0f}°C")
+    gauge(c, 240, 120, 58, mem / 100, p["accent2"] if mem < 85 else p["warn"], "memory", f"{mem:.0f}%")
+    gauge(c, 395, 120, 58, disk / 100, p["accent2"] if disk < 85 else p["warn"], "disk", f"{disk:.0f}%")
+    node = dig(s, "node", "container", default={}) or {}
+    healthy = dig(sysd, "throttle", "healthy", default=True)
+    rows = [
+        ("producer", f"{node.get('state', '?')} · {node.get('health', '?')}", node.get("health") == "healthy"),
+        ("power", "healthy" if healthy else "throttled / under-voltage", bool(healthy)),
+        ("uptime", uptime_text(sysd.get("uptimeSeconds")), True),
+        ("xl1-cli", f"{dig(s, 'release', 'installed', default='?')} ({dig(s, 'release', 'lag', default='?')})", dig(s, "release", "lag") == "current"),
+    ]
+    for i, (k, v, good) in enumerate(rows):
+        y = 200 + i * 24
+        c.label((20, y + 4), k)
+        c.text((140, y), v, 16, p["fg"] if good else p["warn"])
+
+
+PAGE_FUNCS = (page_overview, page_race, page_trend, page_rewards, page_pi)
+
+
+def render(s, theme: str, page: int) -> Image.Image:
+    c = Canvas(theme if theme in THEMES else DEFAULT_THEME)
+    page = page % PAGES
+    header(c, s, page)
+    try:
+        PAGE_FUNCS[page](c, s)
+    except Exception as err:  # a malformed status must never blank the panel
+        c.text((20, 120), "status unreadable", 22, c.p["warn"])
+        c.label((20, 160), type(err).__name__)
+    return c.img
+
+
+def render_win(s, theme: str, frame: int) -> Image.Image:
+    """The celebration when the Pi wins a block. `frame` animates the confetti and the mole hop."""
+    c = Canvas(theme if theme in THEMES else DEFAULT_THEME)
+    p = c.p
+    import random
+    rnd = random.Random(frame)
+    for _ in range(70):
+        x, y = rnd.randrange(W), rnd.randrange(H)
+        if 150 <= y <= 280 and 60 <= x <= W - 60:
+            continue  # keep the text readable
+        col = rnd.choice([p["accent"], p["accent2"], p["good"], p["self"], (255, 255, 255)])
+        sz = rnd.choice([3, 4, 6])
+        c.d.rectangle((x, y, x + sz, y + sz), fill=col)
+    hop = (0, -10, -16, -10)[frame % 4]
+    draw_mole(c, W // 2 - 48, 40 + hop, scale=6)
+    title = "BLOCK WON!" if c.theme != "modern" else "Block produced"
+    c.text((W // 2, 160), title, 40, p["self"], style="smooth" if c.theme == "modern" else "pixel", anchor="ma")
+    c.text((W // 2, 215), f"#{group(lifetime_blocks(s))} lifetime", 24, p["fg"], anchor="ma")
+    c.label((W // 2, 260), f"mainnet head #{group(dig(s, 'chain', 'currentBlock'))}", 12, anchor="ma")
+    return c.img
+
+
+# ── output ────────────────────────────────────────────────────────────────────
+
+
+_LUT = {
+    "r_hi": [v & 0xF8 for v in range(256)],          # red's top 5 bits -> high byte bits 7..3
+    "g_hi": [v >> 5 for v in range(256)],            # green's top 3 bits -> high byte bits 2..0
+    "g_lo": [((v >> 2) & 0x07) << 5 for v in range(256)],  # green's next 3 bits -> low byte 7..5
+    "b_lo": [v >> 3 for v in range(256)],            # blue's top 5 bits -> low byte 4..0
+}
+
+
+def to_rgb565(img: Image.Image) -> bytes:
+    """Little-endian RGB565 for the panel, using only operations every Pillow has (Debian's
+    Pillow 11 has no "BGR;16" packer). The bit fields never overlap, so add() never clips."""
+    from PIL import ImageChops
+    r, g, b = img.convert("RGB").split()
+    hi = ImageChops.add(r.point(_LUT["r_hi"]), g.point(_LUT["g_hi"]))
+    lo = ImageChops.add(g.point(_LUT["g_lo"]), b.point(_LUT["b_lo"]))
+    return Image.merge("LA", (lo, hi)).tobytes()
+
+
+def write_fb(img: Image.Image, fb=FB):
+    with open(fb, "wb") as f:
+        f.write(to_rgb565(img))
+
+
+def read_state(name, default):
+    try:
+        with open(os.path.join(STATE_DIR, name), encoding="ascii") as f:
+            return f.read().strip() or default
+    except OSError:
+        return default
+
+
+def fetch_status():
+    with urllib.request.urlopen(API, timeout=4) as r:
+        return json.load(r)
+
+
+TTY = os.environ.get("XL1_SCREEN_TTY", "/dev/tty1")
+KDSETMODE, KD_TEXT, KD_GRAPHICS = 0x4B3A, 0x00, 0x01
+
+
+def console_mode(graphics: bool):
+    """Stop (or restart) the kernel console drawing on the panel. tty1 is mapped to the panel
+    (fbcon=map:10), so in text mode a kernel message or cursor would paint over the graphics."""
+    try:
+        import fcntl
+        fd = os.open(TTY, os.O_RDWR | os.O_NOCTTY)
+        try:
+            fcntl.ioctl(fd, KDSETMODE, KD_GRAPHICS if graphics else KD_TEXT)
+        finally:
+            os.close(fd)
+    except OSError as err:
+        print(f"xl1-screen-gfx: console mode on {TTY}: {err}", file=sys.stderr, flush=True)
+
+
+def run():
+    import signal
+    console_mode(True)
+
+    def stop(*_):
+        console_mode(False)  # hand the panel back to the text console cleanly
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    write_fb(render_splash(read_state("theme", DEFAULT_THEME)))
+    time.sleep(2)
+    last_key = None
+    last_blocks = None
+    s = {}
+    next_poll = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= next_poll:
+            try:
+                s = fetch_status()
+            except Exception:
+                s = dict(s, status="unreachable")
+            next_poll = now + INTERVAL
+            blocks = lifetime_blocks(s)
+            if last_blocks is not None and blocks > last_blocks:
+                theme = read_state("theme", DEFAULT_THEME)
+                for frame in range(8):  # about 2 s at 4 fps
+                    write_fb(render_win(s, theme, frame))
+                    time.sleep(0.25)
+                last_key = None  # force a redraw of the page after the party
+            if blocks:
+                last_blocks = blocks
+        theme = read_state("theme", DEFAULT_THEME)
+        try:
+            page = int(read_state("page", "0"))
+        except ValueError:
+            page = 0
+        key = (theme, page, s.get("generatedAt"), datetime.now(timezone.utc).strftime("%H:%M"))
+        if key != last_key:
+            write_fb(render(s, theme, page))
+            last_key = key
+        time.sleep(0.2)  # react to taps quickly; drawing only happens when something changed
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--png", help="render one frame to this PNG instead of the panel")
+    ap.add_argument("--status", help="read status JSON from this file instead of the API")
+    ap.add_argument("--theme", default=DEFAULT_THEME, choices=THEMES)
+    ap.add_argument("--page", type=int, default=0)
+    ap.add_argument("--win", action="store_true", help="render the block-won celebration")
+    ap.add_argument("--preview-dir", help="write every theme x page (and the win) as PNGs here")
+    a = ap.parse_args(argv)
+    if a.png or a.preview_dir:
+        s = json.load(open(a.status, encoding="utf-8")) if a.status else fetch_status()
+        if a.preview_dir:
+            os.makedirs(a.preview_dir, exist_ok=True)
+            for t in THEMES:
+                for pg in range(PAGES):
+                    render(s, t, pg).save(os.path.join(a.preview_dir, f"{t}-{pg}-{PAGE_NAMES[pg].lower().replace(' ', '')}.png"))
+                render_win(s, t, 2).save(os.path.join(a.preview_dir, f"{t}-win.png"))
+                render_splash(t).save(os.path.join(a.preview_dir, f"{t}-splash.png"))
+            return 0
+        (render_win(s, a.theme, 2) if a.win else render(s, a.theme, a.page)).save(a.png)
+        return 0
+    run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

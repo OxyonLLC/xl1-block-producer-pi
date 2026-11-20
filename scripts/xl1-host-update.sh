@@ -33,6 +33,13 @@
 # written to ${RUNTIME_FILE} for the collector and dashboard to surface, so
 # deferring them is visible rather than silent.
 #
+# Owner decision 2026-11-19 ("auto update after a 5 count, even if it turns the producer off for a
+# few"): the threshold is 5, and with XL1_HOST_UPDATE_RUNTIME_AUTO=on (the default) the container
+# runtime packages are upgraded on the timer too, together with everything else. Docker restarts
+# and the producer with it, for a minute or two. Afterwards this waits for Docker and checks that
+# xl1-producer.service is active, restarting it once if it is not, and logs the outcome.
+# XL1_HOST_UPDATE_RUNTIME_AUTO=off restores the 2026-10-08 rule (runtime only via --runtime).
+#
 # XL1_HOST_UPDATE_REBOOT decides what a required reboot does:
 #   auto   (default, unchanged) reboot one minute after the upgrade
 #   notify write ${REBOOT_FILE} and leave the reboot to the operator
@@ -44,9 +51,11 @@ APT_LOG="${XL1_HOST_UPDATE_LOG:-/tmp/xl1-host-update.log}"
 LAST_FILE="${STATE_DIR}/.host-update-last"
 RUNTIME_FILE="${STATE_DIR}/.host-update-runtime-pending"
 REBOOT_FILE="${STATE_DIR}/.host-update-reboot-pending"
-THRESHOLD="${XL1_HOST_UPDATE_THRESHOLD:-10}"
+THRESHOLD="${XL1_HOST_UPDATE_THRESHOLD:-5}"
 MAX_AGE="${XL1_HOST_UPDATE_MAX_AGE:-259200}"   # 72h, in seconds
 REBOOT_MODE="${XL1_HOST_UPDATE_REBOOT:-auto}"
+RUNTIME_AUTO="${XL1_HOST_UPDATE_RUNTIME_AUTO:-on}"
+PRODUCER_UNIT="${XL1_PRODUCER_UNIT:-xl1-producer.service}"
 REBOOT_FLAG="${XL1_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
 # Packages whose upgrade restarts the container runtime. A regex over package
 # names (without the architecture suffix).
@@ -67,6 +76,19 @@ done
 log() { printf '%s xl1-host-update: %s\n' "$(date -Is)" "$*"; }
 
 case "${REBOOT_MODE}" in auto|notify) ;; *) log "XL1_HOST_UPDATE_REBOOT=${REBOOT_MODE} is not auto|notify -- refusing to guess"; exit 2 ;; esac
+case "${RUNTIME_AUTO}" in on|off) ;; *) log "XL1_HOST_UPDATE_RUNTIME_AUTO=${RUNTIME_AUTO} is not on|off -- refusing to guess"; exit 2 ;; esac
+
+# After a runtime upgrade: Docker back, then the producer active (one restart if not). Logged either way.
+producer_check() {
+  local i
+  for i in $(seq 1 24); do systemctl is-active --quiet docker.service && break; sleep 5; done
+  if ! systemctl is-active --quiet docker.service; then log "docker.service is NOT active after the runtime upgrade"; return 1; fi
+  for i in $(seq 1 12); do systemctl is-active --quiet "${PRODUCER_UNIT}" && { log "${PRODUCER_UNIT} active again"; return 0; }; sleep 5; done
+  log "${PRODUCER_UNIT} not active after the runtime upgrade -- restarting it once"
+  systemctl restart "${PRODUCER_UNIT}" || true
+  for i in $(seq 1 12); do systemctl is-active --quiet "${PRODUCER_UNIT}" && { log "${PRODUCER_UNIT} active after restart"; return 0; }; sleep 5; done
+  log "${PRODUCER_UNIT} is still NOT active -- needs the operator"; return 1
+}
 
 mkdir -p "${STATE_DIR}"
 
@@ -111,7 +133,8 @@ if (( RUNTIME )); then
   fi
   rm -f "${RUNTIME_FILE}"
   log "runtime upgrade applied"
-  exit 0
+  producer_check
+  exit $?
 fi
 
 last=0
@@ -127,14 +150,21 @@ fi
 if (( SECURITY_PENDING > 0 )); then
   log "${SECURITY_PENDING} security update(s) pending ($(tr '\n' ' ' <<< "${SECURITY_PKGS}")) -- upgrading now (${OTHER_PENDING} non-runtime package(s) in total)"
 else
-  log "${PENDING} pending (${RUNTIME_PENDING} runtime, deferred) / last applied $(( age / 3600 ))h ago -- upgrading"
+  log "${PENDING} pending (${RUNTIME_PENDING} runtime, $([[ "${RUNTIME_AUTO}" == on ]] && echo included || echo deferred)) / last applied $(( age / 3600 ))h ago -- upgrading"
 fi
 if (( CHECK_ONLY )); then
   log "--check given, stopping here"
   exit 0
 fi
 
-if (( OTHER_PENDING == 0 )); then
+INSTALL_PKGS="${OTHER_PKGS}"
+if [[ "${RUNTIME_AUTO}" == "on" ]] && (( RUNTIME_PENDING > 0 )); then
+  INSTALL_PKGS="$(printf '%s\n%s\n' "${OTHER_PKGS}" "${RUNTIME_PKGS}" | grep -v '^$')"
+  log "XL1_HOST_UPDATE_RUNTIME_AUTO=on: including the runtime ($(tr '\n' ' ' <<< "${RUNTIME_PKGS}")) -- Docker and the producer will restart"
+fi
+INSTALL_COUNT="$(count "${INSTALL_PKGS}")"
+
+if (( INSTALL_COUNT == 0 )); then
   # Nothing to install on the timer but the age trigger fired -- record the
   # check so the 72h clock resets rather than firing again on every run.
   echo "${now}" > "${LAST_FILE}"
@@ -150,13 +180,19 @@ fi
 # shellcheck disable=SC2086
 if ! DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y \
       -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-      ${OTHER_PKGS} >"${APT_LOG}" 2>&1; then
+      ${INSTALL_PKGS} >"${APT_LOG}" 2>&1; then
   log "apt-get upgrade FAILED -- see ${APT_LOG}"
   exit 1
 fi
 
 echo "${now}" > "${LAST_FILE}"
-log "upgrade applied (${OTHER_PENDING} package(s); ${RUNTIME_PENDING} runtime deferred)"
+if [[ "${RUNTIME_AUTO}" == "on" ]] && (( RUNTIME_PENDING > 0 )); then
+  rm -f "${RUNTIME_FILE}"
+  log "upgrade applied (${INSTALL_COUNT} package(s), runtime included)"
+  producer_check || true
+else
+  log "upgrade applied (${OTHER_PENDING} package(s); ${RUNTIME_PENDING} runtime deferred)"
+fi
 
 if [[ -f "${REBOOT_FLAG}" ]]; then
   pkgs=""

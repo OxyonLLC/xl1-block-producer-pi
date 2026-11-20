@@ -1,11 +1,35 @@
-# XL1 Block Producer — Raspberry Pi 3 B+
+# XL1 OxyoNode
 
-> **An independent community project by LewSales.** Not affiliated with,
-> endorsed by, or supported by XYO Network. It runs the official
-> [`xl1-docker-images`](https://github.com/XYOracleNetwork/xl1-docker-images)
-> producer unmodified; everything around it — the dashboard, alerting, preflight
-> and operator tooling — is mine. Bugs here are mine too: open an issue on this
-> repo, not with XYO.
+**Turn the Raspberry Pi in your drawer into an XL1 block producer.** XL1 OxyoNode is Oxyon's open-source kit for running an [XL1](https://xyo.network) block producer on a Raspberry Pi 3 B+: the producer, a live dashboard, alerting, and a graphical 3.5" touch display that shows your node at a glance.
+
+Plenty of XYO folks have an old Pi like this one. OxyoNode gives it a job.
+
+| | |
+|---|---|
+| ![The OxyoNode panel, hybrid theme](docs/oxyonode/screen-hybrid-overview.png) | ![The producer race, retro theme](docs/oxyonode/screen-retro-race.png) |
+| ![Pi vitals, modern theme](docs/oxyonode/screen-modern-pi.png) | ![Every block the Pi wins gets a celebration](docs/oxyonode/screen-block-won.png) |
+
+*The screens above are rendered from a live OxyoNode, LewSales-pi3, an XL1 Mainnet producer with 52,000+ blocks.*
+
+## What you get
+- **An XL1 block producer** on a Pi 3 B+ (64-bit Raspberry Pi OS), running the official [`xl1-docker-images`](https://github.com/XYOracleNetwork/xl1-docker-images) producer unmodified.
+- **A local dashboard** with chain status, your producer's blocks and rewards, the producer race, Pi health, and a JSON status API.
+- **A 3.5" touch display** (optional) with three themes: hybrid, retro and modern. Tap or click to change pages; hold for three seconds (or middle-click a USB mouse) to change theme.
+- **Alerts** when something needs you, and **self-maintenance**: host security updates and a doctor command.
+
+## What you need
+- A **Raspberry Pi 3 B+** (a Pi 4 works too), a 32 GB+ microSD card, power and network.
+- Optional: a 3.5" SPI touch panel (ILI9486 / "PiScreen" type).
+- An XL1 producer key. **XL1 Sequence**, the public test network, is open to everyone. **Producing on XL1 Mainnet** requires your producer address to be on XYO's producer allow list.
+
+## Who makes it
+**Oxyon LLC** ([oxyon.io](https://oxyon.io)), built by LewSales. It's open source, so bugs and questions go to this repo's issues.
+
+> **Independent of XYO Network.** Not affiliated with, endorsed by, or supported by XYO Network. OxyoNode runs XYO's official producer image unmodified; everything around it (the dashboard, display, alerting, preflight and operator tooling) is Oxyon's. Please don't take OxyoNode issues to XYO.
+
+---
+
+# Setup guide
 
 A provisioning bundle for running an XL1 federated block producer on the Sequence
 (beta) network, with a local status dashboard.
@@ -25,6 +49,12 @@ for the differences and why each one exists.
 | `scripts/xl1ctl` | Day-to-day control: status, start/stop, logs, backup, doctor. |
 | `scripts/xl1-screen` | Console dashboard for a directly attached display. |
 | `scripts/xl1-screen-setup.sh` | Brings up a 3.5" SPI panel on Bookworm and puts the dashboard on it. |
+| `scripts/xl1-screen-gfx` | Graphical dashboard for the 3.5" panel: three themes (hybrid, retro, modern), drawn straight to the framebuffer. Replaces the console one via `systemd/xl1-screen-gfx.service`. |
+| `scripts/xl1-touch` | Turns taps (and USB mouse clicks) on the panel into page and theme changes. |
+| `scripts/xl1-autoupdate.sh` | Checks the published manifest and installs a newer bundle when one is out. |
+| `scripts/xl1-host-update.sh` | Keeps the Debian packages the producer runs on patched (security fixes on the next run). |
+| `scripts/xl1-publish.sh` | Publishes this node's public status (an allow-listed projection of the dashboard). |
+| `scripts/deploy-dashboard.sh` | Ships a rebuilt dashboard to the Pi by copying three files. |
 | `overlays/` | Device-tree blobs for panels the stock firmware does not ship. |
 | `windows/` | Double-clickable `.cmd` launchers that drive the Pi over SSH. |
 | `xl1-local-arm64.tar.gz` | The producer image, cross-built for arm64. |
@@ -402,6 +432,45 @@ definite failure alarms immediately rather than waiting out the grace period.
 A run that could not read the status document deliberately sends **no** ping.
 
 ---
+
+## The block-race observer
+
+The chain records which candidate won each height and throws away the rest: who
+else offered a block, and when it arrived. That exists only if someone watches.
+`scripts/race/race-service.mjs` watches the network this producer is on, from the
+producer's own place on the network, and `xl1-race-publish` pushes the result to
+xl1-status-data as `race-<network>.json`. oxyon.io/xl1/race/ reads it beside the
+Windows host's observer, which watches the other network. The code is the same
+as `scripts/race/` in xl1-block-producer-windows; keep the two identical.
+
+It is built to cost the producer nothing:
+- **A separate container.** It reuses `xl1-dashboard:local` for its Node runtime only.
+  It has no Docker socket and no producer files, its code is read-only, and its state is
+  in `/var/lib/xl1-race`.
+- **Hard limits.** A quarter of one core at a low CPU weight, and 96 MB.
+- **It steps aside.** Every minute it reads the dashboard's public status. While the
+  producer's 95th-percentile cycle is above `RACE_GUARD_P95_MS` (2500), it stops
+  polling for 10 minutes and says so in its log.
+- **Gentle polling.** The candidate pool every 750 ms, the head every 1 s and pending
+  transactions every 2 s, all read-only public endpoints.
+
+Install (once):
+
+```
+sudo install -d -m 755 /srv/xl1-race
+sudo install -m 644 scripts/race/race-service.mjs scripts/race/race-lib.mjs /srv/xl1-race/
+sudo install -d -o 1000 -g 1000 -m 755 /var/lib/xl1-race
+sudo install -d -o xl1pi -g xl1pi -m 755 /var/lib/xl1-publish-race
+sudo install -m 600 race.env.template /etc/xl1/race.env                    # RACE_NETWORK = the producer's network
+sudo install -m 600 -o xl1pi race-publish.env.template /etc/xl1/publish-race.env   # FILE = race-<network>.json
+sudo install -m 644 systemd/xl1-race.service systemd/xl1-race-publish.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now xl1-race.service xl1-race-publish.timer
+```
+
+Check it: `curl -s 127.0.0.1:8097/health`. To stop it, run
+`sudo systemctl disable --now xl1-race.service xl1-race-publish.timer`; nothing else
+depends on it.
 
 ## Which role reads the chain how
 
