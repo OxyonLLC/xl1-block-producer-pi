@@ -32,6 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Use Node 26
+        # xl1-docker-images (the entrypoint build) requires Node >=26 <27; the arm64
+        # runner ships Node 22, and pnpm refuses with ERR_PNPM_BAD_RUNTIME_VERSION.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
       - name: Install pnpm
         # build-images.sh compiles upstream's entrypoint before the image build
         # and refuses to start without pnpm on PATH.
