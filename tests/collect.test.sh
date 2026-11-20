@@ -8,6 +8,13 @@ COLLECT="${HERE}/../scripts/xl1-collect.sh"
 WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT
 mkdir -p "${WORK}/bin" "${WORK}/state"
 FAILED=0
+
+# Results are read back with python3. Where it is missing (Windows, where
+# "python3" is a Store shortcut that prints and fails) every field read came
+# back empty and the suite reported ten collector faults that were not there.
+# Say it was skipped instead, as the alerter suite does without jq.
+python3 -c 'pass' >/dev/null 2>&1 || { echo "    skipped: python3 not available"; exit 0; }
+
 check() { if [[ "$2" == "$3" ]]; then printf '    ok   %s\n' "$1"; else printf '    FAIL %s\n         want: %s\n         got:  %s\n' "$1" "$3" "$2"; FAILED=$((FAILED+1)); fi; }
 
 mkdocker() { # $1 image id, $2 version, $3 log line
@@ -91,6 +98,27 @@ mkdocker ggg 5.4.0 "[xl1] system ready (producer in 671ms)"
 rm -f "${WORK}/state/.run-builds" "${WORK}/state/.collect-cursor"
 run
 check "a launch that never built reads zero" "$(field "['buildsThisRun']")" "0"
+
+# The Ethereum endpoint: host only. The URL is a secret -- the key rides in its
+# path -- and it must not reach the snapshot in any form.
+check "no endpoint set reads as the image default" "$(field "['evmRpc']['host']")" "null"
+cat > "${WORK}/bin/docker" <<'INNER'
+#!/usr/bin/env bash
+case "$1" in
+  inspect)
+    if [[ "$*" == *Config.Env* ]]; then printf 'XL1_NETWORK=mainnet
+XL1_EVM_RPC_URL=https://user:pw@ETH-Mainnet.g.alchemy.com/v2/SECRETKEY123?x=1
+'
+    else echo "running true 2026-01-01T00:00:00Z 0 xl1:local healthy sha256:eee"; fi; exit 0 ;;
+  logs) echo "[BlockRunner] all good"; exit 0 ;;
+  exec) echo "xl1 5.7.0"; exit 0 ;;
+esac
+exit 0
+INNER
+chmod +x "${WORK}/bin/docker"
+run
+check "endpoint host published, lower-cased" "$(field "['evmRpc']['host']")" '"eth-mainnet.g.alchemy.com"'
+check "endpoint key and credentials never published" "$(grep -cE 'SECRETKEY123|user:pw' "${WORK}/state/producer-status.json")" "0"
 
 # The container disappearing mid-cycle must produce a valid document, not commas.
 cat > "${WORK}/bin/docker" <<'INNER'

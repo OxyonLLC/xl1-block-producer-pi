@@ -19,9 +19,9 @@ bad()  { printf '  %s✗%s %s\n' "${RED}" "${RESET}" "$*"; FAILED=$((FAILED+1));
 
 SHELL_SCRIPTS=(
   "${ROOT}/provision.sh" "${ROOT}/preflight.sh" "${ROOT}/build-images.sh"
-  "${ROOT}/scripts/xl1-collect.sh" "${ROOT}/scripts/xl1-alert.sh"
+  "${ROOT}/scripts/xl1-collect.sh" "${ROOT}/scripts/xl1-alert.sh" "${ROOT}/scripts/xl1-publish.sh"
   "${ROOT}/scripts/xl1ctl" "${ROOT}/scripts/xl1-screen-setup.sh" "${ROOT}/scripts/xl1-screen"
-  "${ROOT}/scripts/xl1-cpu-governor"
+  "${ROOT}/scripts/xl1-cpu-governor" "${ROOT}/scripts/deploy-dashboard.sh"
 )
 
 step "Shell syntax"
@@ -41,7 +41,9 @@ step "JavaScript syntax"
 for f in "${ROOT}/dashboard/server.mjs" "${HERE}/dashboard.test.mjs"; do
   if node --check "$f" 2>/dev/null; then ok "$(basename "$f")"; else bad "$(basename "$f") — syntax error"; fi
 done
-if node -e "const h=require('fs').readFileSync('${ROOT}/dashboard/index.html','utf8'); new Function(h.match(/<script>([\s\S]*)<\/script>/)[1])" 2>/dev/null; then
+# A relative path from inside ROOT: under Git Bash ${ROOT} is /c/..., which node
+# on Windows cannot open, so this reported a parse failure on a page that parses.
+if (cd "${ROOT}" && node -e "const h=require('fs').readFileSync('dashboard/index.html','utf8'); new Function(h.match(/<script>([\s\S]*)<\/script>/)[1])") 2>/dev/null; then
   ok "index.html inline script parses"
 else
   bad "index.html inline script does not parse"
@@ -98,8 +100,23 @@ if bash "${HERE}/collect.test.sh"; then ok "collector tests passed"; else bad "c
 step "Alerter behaviour"
 if bash "${HERE}/alert.test.sh"; then ok "alerter tests passed"; else bad "alerter tests failed"; fi
 
+step "Host update arguments"
+if bash "${HERE}/host-update.test.sh"; then ok "host update tests passed"; else bad "host update tests failed"; fi
+
+step "Dashboard deploy"
+if bash "${HERE}/deploy.test.sh"; then ok "deploy refuses without an alert hold"; else bad "deploy tests failed"; fi
+
 step "Panel parsing"
 if bash "${HERE}/screen.test.sh"; then ok "screen tests passed"; else bad "screen tests failed"; fi
+
+step "Publisher working copy"
+# Needs a working python3 (the publisher parses the payload with it); the Windows Store stub isn't one.
+if python3 -c 'import json' 2>/dev/null; then
+  if bash "${HERE}/publish.test.sh"; then ok "publisher rebuilds an interrupted working copy and prunes old broken copies"; else bad "publisher tests failed"; fi
+else
+  printf '  %spython3 not available; skipped%s
+' "${DIM}" "${RESET}"
+fi
 
 printf '\n'
 if (( FAILED )); then

@@ -162,6 +162,12 @@ else
         then "reboot-required|default|Host reboot required" else empty end),
       (if ($s.system.swap.usedPercent // 0) > 60
         then "swapping|default|Heavy swap use — the Pi is short of RAM" else empty end),
+      # The wait on Ethereum before every candidate. On 2026-10-22 the default
+      # endpoint hung 15-140 s at a time for an hour and a half, candidates
+      # landed late, and every predicate above stayed quiet. The dashboard
+      # decides when (timePayload.alerts) and words it, so both hosts page alike.
+      (if (($s.timePayload.alerts // []) | length) > 0
+        then "slow-payload|high|Slow time payloads — " + (($s.timePayload.alerts // []) | join("; ")) else empty end),
       # The one every other check here misses. On 2026-08-31 this node went two
       # hours without landing a block while the container was up, /livez was
       # green, the chain was reachable, nothing was throttling and the log was
@@ -203,7 +209,193 @@ else
   fi
 fi
 
+# --------------------------------------------------------------- maintenance holds
+#
+# A planned restart of something this watches (the dashboard, say) must not page
+# as an outage -- and must not be handled by switching alerting off, which also
+# silences the producer. A hold names ONE condition key, lasts at most
+# HOLD_MAX_MINUTES, and expires on its own; every other condition keeps firing.
+# The keys that mean the producer itself is down are refused unless
+# XL1_ALERT_HOLD_CRITICAL=1 says so explicitly (a producer maintenance window).
+#
+#   xl1-alert.sh --hold <key> <minutes> <reason...>
+#   xl1-alert.sh --release [key]       (all holds when no key)
+#   xl1-alert.sh --holds
+HOLD_FILE="$(dirname "${STATE}")/.alert-hold"
+HOLD_MAX_MINUTES="${XL1_ALERT_HOLD_MAX_MINUTES:-60}"
+CRITICAL_KEYS=" node-down container-missing container-stopped "
+NOW_HOLD="$(date +%s)"
+active_holds() {  # key<TAB>until<TAB>reason, unexpired only
+  [[ -s "${HOLD_FILE}" ]] || return 0
+  while IFS=$'\t' read -r k u r; do
+    [[ -n "${k}" && "${u}" =~ ^[0-9]+$ ]] && (( u > NOW_HOLD )) && printf '%s\t%s\t%s\n' "${k}" "${u}" "${r}"
+  done < "${HOLD_FILE}"
+}
+case "${MODE}" in
+  --hold)
+    key="${2:-}"; mins="${3:-}"; shift 3 2>/dev/null || true; reason="$*"
+    [[ "${key}" =~ ^[a-z0-9-]+$ ]] || { echo "xl1-alert: --hold needs a condition key (e.g. dashboard-unreachable)" >&2; exit 2; }
+    [[ "${mins}" =~ ^[0-9]+$ ]] && (( mins >= 1 && mins <= HOLD_MAX_MINUTES )) \
+      || { echo "xl1-alert: minutes must be 1-${HOLD_MAX_MINUTES}" >&2; exit 2; }
+    [[ -n "${reason}" ]] || { echo "xl1-alert: give a reason; it is logged with the hold" >&2; exit 2; }
+    if [[ "${CRITICAL_KEYS}" == *" ${key} "* && "${XL1_ALERT_HOLD_CRITICAL:-0}" != "1" ]]; then
+      echo "xl1-alert: ${key} means the producer is down; set XL1_ALERT_HOLD_CRITICAL=1 to hold it on purpose" >&2; exit 2
+    fi
+    # Success is reported only after the hold reads back as active. An
+    # unprivileged run used to print "held …" after the write had failed,
+    # which looks exactly like a hold that is protecting a deploy.
+    if ! { mkdir -p "$(dirname "${HOLD_FILE}")" 2>/dev/null \
+           && { active_holds | grep -v "^${key}	" || true; printf '%s\t%s\t%s\n' "${key}" $(( NOW_HOLD + mins * 60 )) "${reason}"; } > "${HOLD_FILE}.tmp" 2>/dev/null \
+           && mv "${HOLD_FILE}.tmp" "${HOLD_FILE}" 2>/dev/null; } \
+       || ! active_holds | grep -q "^${key}	"; then
+      rm -f "${HOLD_FILE}.tmp" 2>/dev/null
+      echo "xl1-alert: could not write ${HOLD_FILE} (permission? run with sudo) -- NO hold is active" >&2
+      exit 1
+    fi
+    echo "held ${key} for ${mins} min ($(date -d "@$(( NOW_HOLD + mins * 60 ))" -Is 2>/dev/null || echo "+${mins}m")): ${reason}"
+    exit 0 ;;
+  --release)
+    key="${2:-}"
+    if [[ -n "${key}" ]] && ! active_holds | grep -q "^${key}	"; then
+      echo "no active hold on ${key}"
+    elif [[ -n "${key}" ]]; then
+      if ! { { active_holds | grep -v "^${key}	" || true; } > "${HOLD_FILE}.tmp" 2>/dev/null && mv "${HOLD_FILE}.tmp" "${HOLD_FILE}" 2>/dev/null; } \
+         || active_holds | grep -q "^${key}	"; then
+        rm -f "${HOLD_FILE}.tmp" 2>/dev/null
+        echo "xl1-alert: could not update ${HOLD_FILE} (permission? run with sudo) -- ${key} is STILL held" >&2; exit 1
+      fi
+      echo "released ${key}"
+    else
+      if [[ -e "${HOLD_FILE}" ]] && ! : > "${HOLD_FILE}" 2>/dev/null; then
+        echo "xl1-alert: could not clear ${HOLD_FILE} (permission? run with sudo) -- holds are STILL active" >&2; exit 1
+      fi
+      echo "released all holds"
+    fi
+    exit 0 ;;
+  --holds)
+    h="$(active_holds)"; [[ -n "${h}" ]] && printf '%s\n' "${h}" || echo "no active holds"; exit 0 ;;
+esac
+
+# --------------------------------------------------------------- public telemetry
+#
+# The site reads what the publishers pushed, not this node. On 2026-10-11 the
+# Pi's page went six hours stale and the race feed twelve, while every check
+# above was green: the producer produced, the dashboard answered, and the
+# publisher's unit exited "successfully". The only symptom was an old
+# timestamp on a public file, so that is what this reads -- the file's own
+# generatedAt, never just an HTTP 200.
+#
+#   XL1_ALERT_FRESH_FILES  space-separated name=maxAgeSeconds[=publisherEnv]
+#                          publisherEnv: this host's publisher config, when the
+#                          file is published from here (its run state then
+#                          says WHY it is stale); empty for another host's file
+#   XL1_ALERT_FRESH_BASE   where the files are read from
+#   XL1_ALERT_FRESH_EVERY  seconds between reads (results are reused between)
+#
+# A file is stale only when its generatedAt is older than maxAge: four missed
+# five-minute publishes for a status file, three missed for the 15-minute race
+# feed. A failed read is not "stale": the last good timestamp keeps ageing, and
+# only an hour of failed reads is reported, once, as its own condition.
+FRESH_FILES="${XL1_ALERT_FRESH_FILES-rbpi3.json=1200=/etc/xl1/publish-site.env windows.json=1200 race-mainnet.json=2700=/etc/xl1/publish-race.env}"
+FRESH_BASE="${XL1_ALERT_FRESH_BASE:-https://raw.githubusercontent.com/LewSales/xl1-status-data/main}"
+FRESH_EVERY="${XL1_ALERT_FRESH_EVERY:-300}"
+FRESH_CACHE="$(dirname "${STATE}")/.telemetry-fresh"
+FRESH_CHECK_FAIL_AFTER="${XL1_ALERT_FRESH_CHECK_FAIL_AFTER:-3600}"
+
+# name -> "genEpoch<TAB>checkedAt<TAB>failingSince<TAB>status"
+fresh_cached() { [[ -r "${FRESH_CACHE}" ]] && awk -F'\t' -v n="$1" '$1==n {print $2"\t"$3"\t"$4"\t"$5; exit}' "${FRESH_CACHE}"; }
+
+# Prints "genEpoch<TAB>status" for a good document; nothing (and non-zero) otherwise.
+fresh_read() {
+  local body
+  body="$(curl -fsS --max-time 15 "${FRESH_BASE}/$1" 2>/dev/null)" || return 1
+  printf '%s' "${body}" | jq -er '
+    (.generatedAt) as $g
+    | (if ($g|type) == "number" then ($g / (if $g > 100000000000 then 1000 else 1 end) | floor)
+       elif ($g|type) == "string" then ($g | sub("\\.[0-9]+"; "") | fromdateiso8601)
+       else error("no generatedAt") end) as $t
+    | "\($t)\t\(.status // "")"' 2>/dev/null
+}
+
+# Why a file published from THIS host is stale, in the order that explains it.
+fresh_cause() {  # $1 publisher env file
+  if [[ -z "${JSON}" ]]; then echo "dashboard unavailable"; return; fi
+  local wd st fails err
+  wd="$(sed -n 's/^XL1_PUBLISH_WORKDIR=//p' "$1" 2>/dev/null | tail -1)"
+  st="${wd:+${wd}/.git/xl1-publish.state}"
+  if [[ -n "${st}" && -r "${st}" ]]; then
+    fails="$(sed -n 's/^failures=//p' "${st}" | head -1)"
+    err="$(sed -n 's/^lastError=//p' "${st}" | head -1 | cut -c1-200)"
+    if [[ "${fails:-0}" =~ ^[0-9]+$ ]] && (( fails > 0 )); then
+      echo "publisher failing (${fails} run(s) in a row: ${err:-no error recorded})"; return
+    fi
+    echo "publisher reports success (last $(sed -n 's/^lastSuccess=//p' "${st}" | head -1)) -- GitHub or its CDN is behind"; return
+  fi
+  echo "publisher state not readable"
+}
+
+FRESH_CONDITIONS=""
+if [[ -n "${FRESH_FILES}" ]]; then
+  FNOW="$(date +%s)"; NEW_CACHE=""; CHECK_FAILING=""
+  for spec in ${FRESH_FILES}; do
+    IFS='=' read -r fname fmax fenv <<< "${spec}"
+    [[ -n "${fname}" && "${fmax}" =~ ^[0-9]+$ ]] || continue
+    base="${fname%.json}"
+    IFS=$'\t' read -r gen checked fsince fstatus <<< "$(fresh_cached "${fname}")"
+    if [[ ! "${checked:-}" =~ ^[0-9]+$ ]] || (( FNOW - checked >= FRESH_EVERY )); then
+      if got="$(fresh_read "${fname}")" && [[ -n "${got}" ]]; then
+        IFS=$'\t' read -r gen fstatus <<< "${got}"; fsince=""
+      else
+        [[ "${fsince:-}" =~ ^[0-9]+$ ]] || fsince="${FNOW}"
+      fi
+      checked="${FNOW}"
+    fi
+    NEW_CACHE+="${fname}	${gen:-}	${checked}	${fsince:-}	${fstatus:-}"$'\n'
+    [[ "${fsince:-}" =~ ^[0-9]+$ ]] && (( FNOW - fsince >= FRESH_CHECK_FAIL_AFTER )) && CHECK_FAILING+="${fname} "
+    [[ "${gen:-}" =~ ^[0-9]+$ ]] || continue
+    age=$(( FNOW - gen ))
+    if (( age > fmax )); then
+      if [[ -n "${fenv}" ]]; then
+        cause="$(fresh_cause "${fenv}")"
+        # The dashboard being down is already its own alert, and the stale page
+        # is its consequence: say it once, not twice.
+        [[ "${cause}" == "dashboard unavailable" ]] && continue
+      else
+        cause="published by another host; its cause is not visible from here"
+      fi
+      FRESH_CONDITIONS+="telemetry-stale-${base}|default|Public ${fname} is $(( age / 60 )) min old (limit $(( fmax / 60 ))): ${cause}"$'\n'
+    elif [[ -z "${fenv}" && "${fstatus:-}" == "down" ]]; then
+      # Fresh, and saying another host's producer is down: that host may be
+      # unable to tell anyone itself.
+      FRESH_CONDITIONS+="telemetry-producer-down-${base}|high|Public ${fname} reports its producer DOWN"$'\n'
+    fi
+  done
+  [[ -n "${CHECK_FAILING}" ]] && FRESH_CONDITIONS+="telemetry-check-failing|default|Could not read public telemetry for over $(( FRESH_CHECK_FAIL_AFTER / 60 )) min: ${CHECK_FAILING% }"$'\n'
+  # An if, not `A || B && C`: that groups as (A || B) && C, and --status then
+  # still moved whatever tmp file an earlier run had left behind.
+  if [[ "${MODE}" != "--status" ]]; then
+    printf '%s' "${NEW_CACHE}" > "${FRESH_CACHE}.tmp" 2>/dev/null && mv "${FRESH_CACHE}.tmp" "${FRESH_CACHE}" 2>/dev/null || true
+  fi
+  FRESH_CONDITIONS="${FRESH_CONDITIONS%$'\n'}"
+  if [[ -n "${FRESH_CONDITIONS}" ]]; then
+    if [[ -n "${CONDITIONS}" ]]; then CONDITIONS+=$'\n'"${FRESH_CONDITIONS}"; else CONDITIONS="${FRESH_CONDITIONS}"; fi
+  fi
+fi
+
+HOLDS="$(active_holds)"
+is_held() { [[ -n "${HOLDS}" ]] && grep -q "^$1	" <<< "${HOLDS}"; }
+if [[ -n "${HOLDS}" ]]; then
+  while IFS=$'\t' read -r k u r; do echo "xl1-alert: hold active: ${k} until $(date -d "@${u}" -Is 2>/dev/null || echo "${u}") (${r})" >&2; done <<< "${HOLDS}"
+  HELD_OUT=""; KEPT=""
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    if is_held "${line%%|*}"; then HELD_OUT+="${line}"$'\n'; else KEPT+="${line}"$'\n'; fi
+  done <<< "${CONDITIONS}"
+  CONDITIONS="${KEPT%$'\n'}"
+fi
+
 if [[ "${MODE}" == "--status" ]]; then
+  [[ -n "${HELD_OUT:-}" ]] && printf 'held (not notified):\n%s' "${HELD_OUT}"
   # "Could not look" and "looked, found nothing" are different answers.
   if (( ! READABLE )); then printf 'COULD NOT READ STATUS\n%s\n' "${CONDITIONS}"
   elif [[ -z "${CONDITIONS}" ]]; then echo "nothing firing"
@@ -277,8 +469,11 @@ done <<< "${CONDITIONS}"
 # gone, seconds after the dashboard container died. Not seeing a problem is not
 # the same as the problem being fixed. Carry the old state forward untouched.
 if (( READABLE )); then
-  while IFS=$'\t' read -r key _; do
+  while IFS=$'\t' read -r key ts; do
     [[ -z "${key}" ]] && continue
+    # A held key is not observed, so it can be neither still-firing nor
+    # recovered: carry its entry forward and decide when the hold ends.
+    if is_held "${key}"; then NEW_STATE+="${key}	${ts}"$'\n'; continue; fi
     printf '%s' "${CONDITIONS}" | grep -q "^${key}|" || \
       send default "XL1 ${NODE_NAME}: recovered — ${key}" "Cleared $(date -Is)."
   done < "${STATE}"
@@ -320,7 +515,11 @@ STATUS_FILE="$(dirname "${STATE}")/.alert-status"
 # Advisory only, and never fatal: a dashboard that cannot read this shows one
 # row less, but an alerter that died writing its own telemetry would be a
 # monitoring tool defeated by itself.
-printf '{"node":"%s","ranAt":"%s","channels":[%s],"deadman":%s,"cooldownSeconds":%s,"stallBlocks":%s,"launchGraceSeconds":%s}' \
+# Active holds are published too: a held alert must be visible as held, never
+# indistinguishable from a quiet node. Keys and expiry only, no reasons.
+HOLDS_JSON=""
+while IFS=$'\t' read -r k u _; do [[ -n "${k}" ]] && HOLDS_JSON+="{\"key\":\"${k}\",\"until\":${u}},"; done <<< "${HOLDS:-}"
+printf '{"node":"%s","ranAt":"%s","channels":[%s],"deadman":%s,"cooldownSeconds":%s,"stallBlocks":%s,"launchGraceSeconds":%s,"holds":[%s]}' \
   "${NODE_NAME}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${CHANNELS}" "${DEADMAN_SET}" \
-  "${COOLDOWN}" "${STALL_BLOCKS}" "${LAUNCH_GRACE}" \
+  "${COOLDOWN}" "${STALL_BLOCKS}" "${LAUNCH_GRACE}" "${HOLDS_JSON%,}" \
   > "${STATUS_FILE}.tmp" 2>/dev/null && mv "${STATUS_FILE}.tmp" "${STATUS_FILE}" 2>/dev/null || true

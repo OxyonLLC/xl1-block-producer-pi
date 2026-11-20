@@ -20,5 +20,7 @@ windows/_config.cmd
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Python bytecode from running scripts/xl1-touch locally.
 __pycache__/
 *.pyc
